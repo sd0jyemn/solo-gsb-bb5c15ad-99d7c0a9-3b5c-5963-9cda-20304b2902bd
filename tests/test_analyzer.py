@@ -166,6 +166,84 @@ def test_inline_dependency_unique_name_still_resolves() -> None:
     _check("no unresolved refs", result["unresolved"] == [], str(result["unresolved"]))
 
 
+def _build_chain(n: int, license_of) -> dict:
+    packages = []
+    for i in range(n):
+        packages.append({
+            "name": "pkg-%03d" % i,
+            "version": "1.0.0",
+            "license": license_of(i),
+            "dependencies": (["pkg-%03d@1.0.0" % (i + 1)] if i + 1 < n else []),
+        })
+    return {"name": "chain", "packages": packages}
+
+
+def test_long_chain_constraint_distances() -> None:
+    """长链（无冲突）：每项传递约束的 distance 等于链上最短跳数。"""
+    n = 60
+    result = analyzer.analyze_manifest(_build_chain(n, lambda i: "GPL-3.0"))
+    _check("long chain stays clean", result["status"] == "clean", result["status"])
+    _check("long chain has no conflicts", result["conflicts"] == [])
+    nodes = {node["id"]: node for node in result["nodes"]}
+    for i in range(n):
+        node = nodes["pkg-%03d@1.0.0" % i]
+        distances = [c["distance"] for c in node["constraints"]]
+        sources = [c["from"] for c in node["constraints"]]
+        _check(
+            "chain node %d constrained by all ancestors" % i,
+            len(distances) == i,
+            str(distances),
+        )
+        # 约束按 (distance, from) 排序：单链上第 j 个祖先的距离恰为 i - j
+        want = sorted(
+            (("pkg-%03d@1.0.0" % j), i - j) for j in range(i)
+        )
+        got = sorted(zip(sources, distances))
+        _check("chain node %d distances are shortest hops" % i, got == want, str(got))
+        _check(
+            "chain node %d has no hard conflicts" % i,
+            node["conflict_count"] == 0,
+            str(node["conflict_count"]),
+        )
+
+
+def test_long_chain_conflict_count_and_paths() -> None:
+    """长链末端硬冲突：conflict_count 逐节点累计，冲突路径/距离与最短路一致。"""
+    n = 40
+    # 全部 GPL-2.0，末端一个 Apache-2.0：每个祖先对末端都是硬冲突
+    result = analyzer.analyze_manifest(
+        _build_chain(n, lambda i: "Apache-2.0" if i == n - 1 else "GPL-2.0")
+    )
+    leaf = "pkg-%03d@1.0.0" % (n - 1)
+    leaf_conflicts = [c for c in result["conflicts"] if c["node"] == leaf]
+    _check(
+        "every ancestor conflicts with leaf",
+        len(leaf_conflicts) == n - 1 and all(c["severity"] == "error" for c in leaf_conflicts),
+        str(len(leaf_conflicts)),
+    )
+    for conflict in leaf_conflicts:
+        j = int(conflict["ancestor"].split("@")[0].rsplit("-", 1)[1])
+        want_distance = n - 1 - j
+        _check(
+            "conflict distance is shortest hops",
+            conflict["distance"] == want_distance
+            and len(conflict["path"]) == want_distance + 1
+            and conflict["path"][0] == conflict["ancestor"]
+            and conflict["path"][-1] == leaf,
+            str(conflict["path"]),
+        )
+    nodes = {node["id"]: node for node in result["nodes"]}
+    _check(
+        "leaf accumulates all hard conflicts",
+        nodes[leaf]["conflict_count"] == n - 1,
+        str(nodes[leaf]["conflict_count"]),
+    )
+    _check(
+        "other nodes have no hard conflicts",
+        all(nodes["pkg-%03d@1.0.0" % i]["conflict_count"] == 0 for i in range(n - 1)),
+    )
+
+
 def main() -> None:
     test_normalization()
     test_matrix_rules()
@@ -174,6 +252,8 @@ def main() -> None:
     test_unresolved_and_filter()
     test_inline_dependency_registration_order()
     test_inline_dependency_unique_name_still_resolves()
+    test_long_chain_constraint_distances()
+    test_long_chain_conflict_count_and_paths()
     print("\nall tests passed.")
 
 
