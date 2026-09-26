@@ -394,8 +394,15 @@ def _build_result(
 
     # 对每个节点做 BFS：沿依赖边传播祖先许可证约束。
     # BFS 首次到达即为最短依赖路径；对同一祖先只在首次到达处判定一次。
+    # 首次访问时记录最短距离，约束直接使用；只有实际产生冲突/告警时才
+    # 按父节点链重建最短路径，避免为每条约束反复回溯完整路径。
     for ancestor in order:
+        # 祖先侧信息只依赖祖先自身，整个 BFS 期间不变，提取到循环外
+        ancestor_node = nodes[ancestor]
+        ancestor_tokens = license_tokens(ancestor_node)
+        ancestor_imposes = any(lic.imposes_constraint(token) for token in ancestor_tokens)
         parents: Dict[str, Optional[str]] = {ancestor: None}
+        distance: Dict[str, int] = {ancestor: 0}
         visited_ancestors: Set[str] = {ancestor}
         queue: deque[str] = deque([ancestor])
         while queue:
@@ -404,14 +411,14 @@ def _build_result(
                 if nxt in parents:
                     continue  # BFS 已找到更短路径；同时天然处理环
                 parents[nxt] = current
+                distance[nxt] = distance[current] + 1
                 if nxt not in visited_ancestors:
                     visited_ancestors.add(nxt)
                     queue.append(nxt)
 
-                ancestor_node = nodes[ancestor]
                 dep_node = nodes[nxt]
                 judgment = lic.compatibility_candidates(
-                    license_tokens(ancestor_node), license_tokens(dep_node)
+                    ancestor_tokens, license_tokens(dep_node)
                 )
                 status = judgment["status"]
                 multi_pair = (
@@ -430,7 +437,7 @@ def _build_result(
                         "node_license": dep_node["license_display"],
                         "ancestor_multi": bool(ancestor_node.get("license_multi")),
                         "node_multi": bool(dep_node.get("license_multi")),
-                        "distance": len(path) - 1,
+                        "distance": distance[nxt],
                         "path": path,
                         "reason": judgment["reason"],
                     }
@@ -454,13 +461,17 @@ def _build_result(
                             ),
                         }
                     conflicts.append(conflict)
-                if any(lic.imposes_constraint(token) for token in license_tokens(ancestor_node)):
+                    if status == lic.CONFLICT:
+                        # 生成硬冲突时同步累计目标包的硬冲突数，
+                        # 收尾无需再按每个节点扫描全部冲突
+                        nodes[nxt]["conflict_count"] += 1
+                if ancestor_imposes:
                     nodes[nxt]["constraints"].append(
                         {
                             "from": ancestor,
                             "license": ancestor_node["license_display"],
                             "category": ancestor_node["license_category"],
-                            "distance": _distance_to(parents, ancestor, nxt),
+                            "distance": distance[nxt],
                             "status": status,
                         }
                     )
@@ -468,9 +479,6 @@ def _build_result(
     # 约束按距离排序，冲突排序：错误优先 -> 距离短 -> 名字
     for nid in order:
         nodes[nid]["constraints"].sort(key=lambda c: (c["distance"], c["from"]))
-        nodes[nid]["conflict_count"] = sum(
-            1 for c in conflicts if c["severity"] == "error" and c["node"] == nid
-        )
 
     conflicts.sort(key=lambda c: (0 if c["severity"] == "error" else 1, c["distance"], c["node"], c["ancestor"]))
 
@@ -523,10 +531,6 @@ def _reconstruct_path(parents: Dict[str, Optional[str]], start: str, end: str) -
         path.append(cur)
     path.reverse()
     return path
-
-
-def _distance_to(parents: Dict[str, Optional[str]], start: str, end: str) -> int:
-    return len(_reconstruct_path(parents, start, end)) - 1
 
 
 def _empty_result(name: str) -> Dict[str, Any]:
